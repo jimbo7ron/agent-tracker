@@ -11,6 +11,8 @@ import json
 import sqlite3
 import sys
 import time
+from collections import defaultdict
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -98,7 +100,6 @@ def insert_snapshots(conn: sqlite3.Connection, agent: str, sessions: dict, captu
 
 def day_bounds_utc(date_str: str) -> tuple[int, int]:
     """Return (start_unix, end_unix) for a YYYY-MM-DD date in Sydney timezone."""
-    from datetime import datetime, timedelta
     local_start = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=TZ)
     local_end = local_start + timedelta(days=1)
     return int(local_start.timestamp()), int(local_end.timestamp())
@@ -132,7 +133,6 @@ def recompute_daily_usage(conn: sqlite3.Connection, date_str: str) -> None:
 
     # Group by (session_key, agent, model) — model can change per session key
     # Use the model from the most recent snapshot for that session
-    from collections import defaultdict
     session_snapshots: dict[str, list] = defaultdict(list)
     session_meta: dict[str, tuple[str, str]] = {}  # session_key -> (agent, model)
 
@@ -180,7 +180,6 @@ def recompute_daily_usage(conn: sqlite3.Connection, date_str: str) -> None:
 
 def today_sydney() -> str:
     """Return today's date string in Australia/Sydney timezone."""
-    from datetime import datetime
     return datetime.now(tz=TZ).strftime("%Y-%m-%d")
 
 
