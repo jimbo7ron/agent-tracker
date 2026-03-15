@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 AGENTS = ["main", "case", "kipp", "brand"]
 SESSIONS_BASE = Path.home() / ".openclaw" / "agents"
 DB_PATH = Path(__file__).parent / "usage.db"
+LOG_DIR = Path.home() / ".openclaw" / "logs"
 TZ = ZoneInfo("Australia/Sydney")
 
 
@@ -184,6 +185,9 @@ def today_sydney() -> str:
 
 
 def collect() -> None:
+    # Ensure log dir exists so crontab redirect doesn't fail silently on first run
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
     conn = get_db()
     init_db(conn)
 
