@@ -253,6 +253,42 @@ class TestSessionResetHandling:
         assert row is not None
         assert row["tokens_delta"] >= 0
 
+    def test_session_reset_correct_delta(self, tmp_db):
+        """Single reset: delta = first_segment_growth + second_segment_growth."""
+        conn, c, _ = tmp_db
+        # Segment 1: 10k → 15k (+5k), reset, Segment 2: 2k → 5k (+3k)
+        self._insert_snap(conn, "main", "agent:main:x:1", 10000, 1800)
+        self._insert_snap(conn, "main", "agent:main:x:1", 15000, 3600)
+        self._insert_snap(conn, "main", "agent:main:x:1", 2000, 5400)   # reset
+        self._insert_snap(conn, "main", "agent:main:x:1", 5000, 7200)
+
+        c.recompute_daily_usage(conn, "2026-03-16")
+
+        row = conn.execute(
+            "SELECT tokens_delta FROM daily_usage WHERE date='2026-03-16' AND agent='main'"
+        ).fetchone()
+        assert row is not None
+        assert row["tokens_delta"] == 8000  # 5k + 3k
+
+    def test_double_session_reset(self, tmp_db):
+        """Two resets in one day: all three segments counted correctly."""
+        conn, c, _ = tmp_db
+        # Seg 1: 1k→3k (+2k), reset, Seg 2: 500→1500 (+1k), reset, Seg 3: 100→600 (+500)
+        self._insert_snap(conn, "main", "agent:main:x:1", 1000, 1800)
+        self._insert_snap(conn, "main", "agent:main:x:1", 3000, 3600)
+        self._insert_snap(conn, "main", "agent:main:x:1", 500, 5400)    # reset 1
+        self._insert_snap(conn, "main", "agent:main:x:1", 1500, 7200)
+        self._insert_snap(conn, "main", "agent:main:x:1", 100, 9000)    # reset 2
+        self._insert_snap(conn, "main", "agent:main:x:1", 600, 10800)
+
+        c.recompute_daily_usage(conn, "2026-03-16")
+
+        row = conn.execute(
+            "SELECT tokens_delta FROM daily_usage WHERE date='2026-03-16' AND agent='main'"
+        ).fetchone()
+        assert row is not None
+        assert row["tokens_delta"] == 3500  # 2k + 1k + 500
+
 
 class TestTimezoneBucketing:
     def test_11pm_and_1am_on_different_days(self, tmp_db):

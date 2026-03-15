@@ -145,26 +145,20 @@ def recompute_daily_usage(conn: sqlite3.Connection, date_str: str) -> None:
         agent, model = session_meta[session_key]
         agg_key = (agent, model)
 
-        # Compute delta handling resets (decreases)
+        # Compute delta handling multiple resets (decreases).
+        # Split into monotonically non-decreasing segments at each reset boundary,
+        # accumulate (max - min) = (last - first) for each segment.
         delta = 0
+        segment_start = token_list[0]
         prev = token_list[0]
         for curr in token_list[1:]:
-            if curr >= prev:
-                # Normal growth — will be captured in MAX-MIN
-                pass
-            else:
-                # Reset detected: prev was a local max, add it as contribution,
-                # restart from 0 (curr becomes new base)
-                delta += prev - token_list[0]  # this sequence contribution
-                prev = curr
-                # Start a new sub-sequence
-                token_list = token_list[token_list.index(curr):]
-                break
+            if curr < prev:
+                # Reset: close out this segment and start a new one
+                delta += prev - segment_start
+                segment_start = curr
             prev = curr
-
-        # Final contribution: MAX - MIN of remaining sequence
-        if token_list:
-            delta += max(token_list) - min(token_list)
+        # Close final segment
+        delta += prev - segment_start
 
         deltas[agg_key] = deltas.get(agg_key, 0) + delta
 
