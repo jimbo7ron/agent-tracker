@@ -1,151 +1,165 @@
+"""
+tracker.py — Discord-friendly token usage reporter for Agent Token Tracker v2.
+
+Reads from daily_usage table in SQLite and outputs a bar chart with
+token counts and estimated costs.
+
+Run: Called by Tesseract "Agent Token Report" job at 8am Sydney time.
+"""
+
 import sqlite3
-import datetime
-import sys
-import json
-import os
-import glob
+from datetime import datetime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
 
-# DB setup
-db_path = os.path.expanduser("~/repos/agent-tracker/usage.db")
-os.makedirs(os.path.dirname(db_path), exist_ok=True)
+DB_PATH = Path(__file__).parent / "usage.db"
+TZ = ZoneInfo("Australia/Sydney")
 
-def init_db():
-    conn = sqlite3.connect(db_path)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS usage
-                 (timestamp DATETIME, agent TEXT, model TEXT, tokens_in INTEGER, tokens_out INTEGER)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS processed_files
-                 (filename TEXT PRIMARY KEY)''')
-    conn.commit()
+AGENTS = ["main", "case", "kipp", "brand"]
+AGENT_DISPLAY = {
+    "main": "TARS",
+    "case": "CASE",
+    "kipp": "KIPP",
+    "brand": "Brand",
+}
+
+# Blended cost per 1k tokens (input+cache+output mixed)
+PRICE_PER_1K: dict[str, float] = {
+    "claude-sonnet-4-6": 0.005,
+    "claude-opus-4-6": 0.025,
+    "claude-haiku-4-5": 0.001,
+    "google/gemini-2.5-flash": 0.001,
+    "google/gemini-3.1-pro-preview": 0.003,
+    "default": 0.005,
+}
+
+BAR_MAX_WIDTH = 12
+
+
+def get_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def cost_for_tokens(tokens: int, model: str) -> float:
+    rate = PRICE_PER_1K.get(model, PRICE_PER_1K["default"])
+    return (tokens / 1000) * rate
+
+
+def make_bar(value: int, max_value: int, width: int = BAR_MAX_WIDTH) -> str:
+    if max_value <= 0:
+        return ""
+    filled = round((value / max_value) * width)
+    return "█" * filled
+
+
+def format_tokens(tokens: int) -> str:
+    if tokens >= 1_000_000:
+        return f"{tokens / 1_000_000:.1f}M"
+    if tokens >= 1_000:
+        return f"{tokens / 1_000:.0f}k"
+    return str(tokens)
+
+
+def get_today_usage(conn: sqlite3.Connection, date_str: str) -> dict[str, dict]:
+    """Returns {agent: {model: tokens, ...}} for today."""
+    rows = conn.execute(
+        "SELECT agent, model, tokens_delta FROM daily_usage WHERE date = ?",
+        (date_str,),
+    ).fetchall()
+
+    result: dict[str, dict] = {a: {} for a in AGENTS}
+    for row in rows:
+        agent = row["agent"]
+        if agent in result:
+            result[agent][row["model"]] = result[agent].get(row["model"], 0) + row["tokens_delta"]
+    return result
+
+
+def get_week_usage(conn: sqlite3.Connection, dates: list[str]) -> dict[str, dict[str, int]]:
+    """Returns {agent: {date: tokens}} for the given date list."""
+    placeholders = ",".join("?" * len(dates))
+    rows = conn.execute(
+        f"SELECT agent, date, SUM(tokens_delta) as total FROM daily_usage WHERE date IN ({placeholders}) GROUP BY agent, date",
+        dates,
+    ).fetchall()
+
+    result: dict[str, dict[str, int]] = {a: {d: 0 for d in dates} for a in AGENTS}
+    for row in rows:
+        agent = row["agent"]
+        if agent in result:
+            result[agent][row["date"]] = row["total"]
+    return result
+
+
+def report() -> str:
+    if not DB_PATH.exists():
+        return "📊 No token data yet today."
+
+    conn = get_db()
+
+    now = datetime.now(tz=TZ)
+    today_str = now.strftime("%Y-%m-%d")
+    today_display = now.strftime("%a %d %b %Y")
+
+    # 7-day window: today + 6 prior days
+    dates = [(now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(6, -1, -1)]
+    day_labels = [(now - timedelta(days=i)).strftime("%a") for i in range(6, -1, -1)]
+
+    today_data = get_today_usage(conn, today_str)
+    week_data = get_week_usage(conn, dates)
     conn.close()
 
-def log_usage(agent, model, tokens_in, tokens_out, timestamp):
-    conn = sqlite3.connect(db_path)
-    c = conn.cursor()
-    c.execute("INSERT INTO usage VALUES (?, ?, ?, ?, ?)",
-              (timestamp, agent, model, tokens_in, tokens_out))
-    conn.commit()
-    conn.close()
+    # --- Today section ---
+    today_totals: dict[str, int] = {}
+    today_costs: dict[str, float] = {}
+    for agent in AGENTS:
+        models = today_data.get(agent, {})
+        total = sum(models.values())
+        cost = sum(cost_for_tokens(t, m) for m, t in models.items())
+        today_totals[agent] = total
+        today_costs[agent] = cost
 
-def mark_file_processed(filename):
-    conn = sqlite3.connect(db_path)
-    c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO processed_files VALUES (?)", (filename,))
-    conn.commit()
-    conn.close()
+    grand_total = sum(today_totals.values())
+    grand_cost = sum(today_costs.values())
 
-def is_file_processed(filename):
-    conn = sqlite3.connect(db_path)
-    c = conn.cursor()
-    c.execute("SELECT 1 FROM processed_files WHERE filename = ?", (filename,))
-    res = c.fetchone()
-    conn.close()
-    return res is not None
+    if grand_total == 0:
+        return "📊 No token data yet today."
 
-def parse_runs():
-    init_db()
-    # Capture cron runs AND all agent sessions
-    search_paths = [
-        os.path.expanduser("~/.openclaw/cron/runs/*.jsonl"),
-        os.path.expanduser("~/.openclaw/agents/*/sessions/*.jsonl")
-    ]
-    
-    files = []
-    for path in search_paths:
-        files.extend(glob.glob(path))
-    
-    for filepath in files:
-        filename = os.path.basename(filepath)
-        # Unique identifier by full path to avoid collision
-        file_id = filepath
-        if is_file_processed(file_id):
-            continue
-            
-        print(f"Processing {filename}...")
-        try:
-            with open(filepath, 'r') as f:
-                for line in f:
-                    try:
-                        data = json.loads(line)
-                        # Look for usage in both cron and session message formats
-                        usage = data.get("usage")
-                        if not usage and "message" in data:
-                            usage = data["message"].get("usage")
-                        
-                        if not usage:
-                            continue
-                            
-                        # Extract Agent
-                        # For cron: "agentId": "kipp"
-                        # For sessions: session_key or agent subfolder in path
-                        agent = data.get("agentId")
-                        if not agent:
-                            path_parts = filepath.split('/')
-                            if 'agents' in path_parts:
-                                agent = path_parts[path_parts.index('agents') + 1]
-                        if not agent:
-                            agent = "main"
-                        
-                        # Extract Model
-                        model = data.get("model")
-                        if not model and "message" in data:
-                            model = data["message"].get("model")
-                        if not model:
-                            model = "unknown"
-                        
-                        # Extract tokens
-                        tokens_in = usage.get("input_tokens", usage.get("input", 0))
-                        tokens_out = usage.get("output_tokens", usage.get("output", 0))
-                        
-                        # Extract timestamp
-                        ts = data.get("ts") or data.get("timestamp")
-                        if isinstance(ts, (int, float)):
-                             timestamp = datetime.datetime.fromtimestamp(ts / 1000.0).isoformat()
-                        elif isinstance(ts, str):
-                            timestamp = ts
-                        else:
-                            timestamp = datetime.datetime.now().isoformat()
-                        
-                        log_usage(agent, model, tokens_in, tokens_out, timestamp)
-                    except Exception as e:
-                        pass
-            
-            mark_file_processed(file_id)
-            print(f"Done processing {filename}.")
-        except Exception as e:
-            print(f"Error processing file {filename}: {e}")
+    max_tokens = max(today_totals.values()) if today_totals else 1
 
-def print_chart():
-    conn = sqlite3.connect(db_path)
-    c = conn.cursor()
-    today = datetime.date.today().isoformat()
-    c.execute("SELECT agent, model, SUM(tokens_in) + SUM(tokens_out) as total FROM usage WHERE date(timestamp) = ? GROUP BY agent, model ORDER BY total DESC", (today,))
-    rows = c.fetchall()
-    conn.close()
+    lines = [f"📊 Agent Token Report — {today_display}", "", "Today so far:"]
 
-    if not rows:
-        print("No usage data for today.")
-        return
+    # Max display name length for padding
+    name_width = max(len(AGENT_DISPLAY[a]) for a in AGENTS)
 
-    max_val = max(row[2] for row in rows)
-    
-    print(f"📊 **Agent Usage Summary - {today}**")
-    for agent, model, total in rows:
-        bar_length = int((total / max_val) * 20) if max_val > 0 else 0
-        bar = "█" * bar_length
-        formatted_total = f"{total/1_000_000:.1f}M" if total > 1_000_000 else f"{total/1_000:.0f}K"
-        print(f"`{agent} ({model})`: {bar} {formatted_total}")
+    for agent in AGENTS:
+        tokens = today_totals[agent]
+        cost = today_costs[agent]
+        name = AGENT_DISPLAY[agent].ljust(name_width)
+        bar = make_bar(tokens, max_tokens).ljust(BAR_MAX_WIDTH)
+        token_str = f"{tokens:,}"
+        lines.append(f"  {name}  {bar}  {token_str:<8}  tokens  (~${cost:.2f})")
+
+    lines.append(f"  {'─' * (name_width + 2 + BAR_MAX_WIDTH + 32)}")
+    lines.append(f"  {'Total'.ljust(name_width + BAR_MAX_WIDTH + 4)}  {grand_total:,}  tokens  (~${grand_cost:.2f})")
+
+    # --- 7-day rolling section ---
+    lines.append("")
+    lines.append("7-day rolling (per agent):")
+
+    for agent in AGENTS:
+        name = AGENT_DISPLAY[agent]
+        day_vals = week_data.get(agent, {})
+        parts = []
+        for date_str, label in zip(dates, day_labels):
+            val = day_vals.get(date_str, 0)
+            parts.append(f"  {label} {format_tokens(val):>5}")
+        lines.append(f"  {name + ':' :<6}" + "".join(parts))
+
+    return "\n".join(lines)
+
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        if sys.argv[1] == "log":
-            init_db()
-            log_usage(sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5]), datetime.datetime.now().isoformat())
-        elif sys.argv[1] == "parse":
-            parse_runs()
-        elif sys.argv[1] == "mark":
-            init_db()
-            mark_file_processed(sys.argv[2])
-    else:
-        init_db()
-        print_chart()
+    print(report())
