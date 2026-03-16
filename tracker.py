@@ -161,5 +161,44 @@ def report() -> str:
     return "\n".join(lines)
 
 
+def post_to_discord(message: str) -> bool:
+    """Post a message to the #tars Discord channel via bot token."""
+    import json
+    import urllib.request
+
+    secrets_path = Path.home() / ".openclaw" / "workspace" / "secrets.json"
+    try:
+        secrets = json.loads(secrets_path.read_text())
+        token = secrets["discord_bot_token"]
+        channel_id = "1467467217909321823"  # #tars
+    except (KeyError, FileNotFoundError, json.JSONDecodeError):
+        return False
+
+    url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
+    data = json.dumps({"content": message}).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data,
+        headers={
+            "Authorization": f"Bot {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "AgentTracker/2.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
 if __name__ == "__main__":
-    print(report())
+    output = report()
+    if output == "📊 No token data yet today.":
+        # Nothing to report — stay silent
+        pass
+    else:
+        # Post to Discord (Tesseract shellCommand jobs don't forward stdout)
+        if not post_to_discord(output):
+            # Fallback: print to stdout so it ends up in logs
+            print(output)
