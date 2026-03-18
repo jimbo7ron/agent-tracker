@@ -193,6 +193,7 @@ def post_to_discord(message: str) -> bool:
 
 
 if __name__ == "__main__":
+    import sys
     output = report()
     if output == "📊 No token data yet today.":
         # Nothing to report — stay silent
@@ -200,5 +201,5 @@ if __name__ == "__main__":
     else:
         # Post to Discord (Tesseract shellCommand jobs don't forward stdout)
         if not post_to_discord(output):
-            # Fallback: print to stdout so it ends up in logs
-            print(output)
+            print(f"[tracker] ERROR: failed to post to Discord", file=sys.stderr)
+            sys.exit(1)

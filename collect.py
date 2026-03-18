@@ -188,8 +188,12 @@ def collect() -> None:
     # Ensure log dir exists so crontab redirect doesn't fail silently on first run
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-    conn = get_db()
-    init_db(conn)
+    try:
+        conn = get_db()
+        init_db(conn)
+    except Exception as e:
+        print(f"[collect] ERROR: failed to open/init DB: {e}", file=sys.stderr)
+        sys.exit(1)
 
     captured_at = int(time.time())
     total_sessions = 0
@@ -198,11 +202,21 @@ def collect() -> None:
         sessions = read_sessions(agent)
         if not sessions:
             continue
-        n = insert_snapshots(conn, agent, sessions, captured_at)
-        total_sessions += n
+        try:
+            n = insert_snapshots(conn, agent, sessions, captured_at)
+            total_sessions += n
+        except Exception as e:
+            print(f"[collect] ERROR: failed to insert snapshots for {agent}: {e}", file=sys.stderr)
+            conn.close()
+            sys.exit(1)
 
     date_str = today_sydney()
-    recompute_daily_usage(conn, date_str)
+    try:
+        recompute_daily_usage(conn, date_str)
+    except Exception as e:
+        print(f"[collect] ERROR: failed to recompute daily usage: {e}", file=sys.stderr)
+        conn.close()
+        sys.exit(1)
 
     conn.close()
 
